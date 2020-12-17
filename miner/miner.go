@@ -19,19 +19,21 @@ package miner
 
 import (
 	"fmt"
+	"math/big"
 	"sync/atomic"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/eth/downloader"
+	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/event"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
-	"github.com/ethereum/go-ethereum/ethdb"
 )
 
 // Backend wraps all methods required for mining.
@@ -39,6 +41,19 @@ type Backend interface {
 	BlockChain() *core.BlockChain
 	TxPool() *core.TxPool
 	ChainDb() ethdb.Database
+}
+
+// Config is the configuration parameters of mining.
+type Config struct {
+	Etherbase              common.Address `toml:",omitempty"` // Public address for block mining rewards (default = first account)
+	Notify                 []string       `toml:",omitempty"` // HTTP URL list to be notified of new work packages(only useful in ethash).
+	ExtraData              hexutil.Bytes  `toml:",omitempty"` // Block extra data set by the miner
+	GasFloor               uint64         // Target gas floor for mined blocks.
+	GasCeil                uint64         // Target gas ceiling for mined blocks.
+	GasPrice               *big.Int       // Minimum gas price for mining a transaction
+	Recommit               time.Duration  // The time interval for miner to re-create mining work.
+	Noverify               bool           // Disable remote mining solution verification(only useful in ethash).
+	AllowedFutureBlockTime uint64         // Max time (in seconds) from current time allowed for blocks, before they're considered future blocks
 }
 
 // Miner creates blocks and searches for proof-of-work values.
@@ -54,13 +69,13 @@ type Miner struct {
 	shouldStart int32 // should start indicates whether we should start after sync
 }
 
-func New(eth Backend, config *params.ChainConfig, mux *event.TypeMux, engine consensus.Engine, recommit time.Duration, gasFloor, gasCeil uint64, isLocalBlock func(block *types.Block) bool) *Miner {
+func New(eth Backend, config *Config, chainConfig *params.ChainConfig, mux *event.TypeMux, engine consensus.Engine, isLocalBlock func(block *types.Block) bool) *Miner {
 	miner := &Miner{
 		eth:      eth,
 		mux:      mux,
 		engine:   engine,
 		exitCh:   make(chan struct{}),
-		worker:   newWorker(config, engine, eth, mux, recommit, gasFloor, gasCeil, isLocalBlock),
+		worker:   newWorker(config, chainConfig, engine, eth, mux, isLocalBlock),
 		canStart: 1,
 	}
 	go miner.update()

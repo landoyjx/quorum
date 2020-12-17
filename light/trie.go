@@ -21,6 +21,8 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/ethereum/go-ethereum/core/rawdb"
+
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
@@ -67,7 +69,7 @@ func (db *odrDatabase) CopyTrie(t state.Trie) state.Trie {
 }
 
 func (db *odrDatabase) ContractCode(addrHash, codeHash common.Hash) ([]byte, error) {
-	if codeHash == sha3_nil {
+	if codeHash == sha3Nil {
 		return nil, nil
 	}
 	if code, err := db.backend.Database().Get(codeHash[:]); err == nil {
@@ -89,6 +91,28 @@ func (db *odrDatabase) TrieDB() *trie.Database {
 	return nil
 }
 
+// Quorum - Privacy Enhancements
+type stubPrivacyMetadataLinker struct {
+}
+
+func newPrivacyMetadataLinkerStub() rawdb.PrivacyMetadataLinker {
+	return &stubPrivacyMetadataLinker{}
+}
+
+func (pml *stubPrivacyMetadataLinker) PrivacyMetadataRootForPrivateStateRoot(privateStateRoot common.Hash) common.Hash {
+	return common.Hash{}
+}
+
+func (pml *stubPrivacyMetadataLinker) LinkPrivacyMetadataRootToPrivateStateRoot(privateStateRoot, privacyMetadataRoot common.Hash) error {
+	return nil
+}
+
+func (db *odrDatabase) PrivacyMetadataLinker() rawdb.PrivacyMetadataLinker {
+	return newPrivacyMetadataLinkerStub()
+}
+
+// End Quorum - Privacy Enhancements
+
 type odrTrie struct {
 	db   *odrDatabase
 	id   *TrieID
@@ -108,7 +132,7 @@ func (t *odrTrie) TryGet(key []byte) ([]byte, error) {
 func (t *odrTrie) TryUpdate(key, value []byte) error {
 	key = crypto.Keccak256(key)
 	return t.do(key, func() error {
-		return t.trie.TryDelete(key)
+		return t.trie.TryUpdate(key, value)
 	})
 }
 
@@ -141,7 +165,7 @@ func (t *odrTrie) GetKey(sha []byte) []byte {
 	return nil
 }
 
-func (t *odrTrie) Prove(key []byte, fromLevel uint, proofDb ethdb.Putter) error {
+func (t *odrTrie) Prove(key []byte, fromLevel uint, proofDb ethdb.KeyValueWriter) error {
 	return errors.New("not implemented, needs client/server interface split")
 }
 

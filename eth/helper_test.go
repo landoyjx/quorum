@@ -22,14 +22,22 @@ package eth
 import (
 	"crypto/ecdsa"
 	"crypto/rand"
+	"fmt"
 	"math/big"
 	"sort"
 	"sync"
 	"testing"
 
+	"github.com/ethereum/go-ethereum/consensus"
+	"github.com/ethereum/go-ethereum/consensus/clique"
+	"github.com/ethereum/go-ethereum/consensus/istanbul"
+	istanbulBackend "github.com/ethereum/go-ethereum/consensus/istanbul/backend"
+
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus/ethash"
 	"github.com/ethereum/go-ethereum/core"
+	"github.com/ethereum/go-ethereum/core/forkid"
+	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/crypto"
@@ -49,11 +57,11 @@ var (
 // newTestProtocolManager creates a new protocol manager for testing purposes,
 // with the given number of blocks already known, and potential notification
 // channels for different events.
-func newTestProtocolManager(mode downloader.SyncMode, blocks int, generator func(int, *core.BlockGen), newtx chan<- []*types.Transaction) (*ProtocolManager, *ethdb.MemDatabase, error) {
+func newTestProtocolManager(mode downloader.SyncMode, blocks int, generator func(int, *core.BlockGen), newtx chan<- []*types.Transaction) (*ProtocolManager, ethdb.Database, error) {
 	var (
 		evmux  = new(event.TypeMux)
 		engine = ethash.NewFaker()
-		db     = ethdb.NewMemDatabase()
+		db     = rawdb.NewMemoryDatabase()
 		gspec  = &core.Genesis{
 			Config: params.TestChainConfig,
 			Alloc:  core.GenesisAlloc{testBank: {Balance: big.NewInt(1000000)}},
@@ -65,8 +73,59 @@ func newTestProtocolManager(mode downloader.SyncMode, blocks int, generator func
 	if _, err := blockchain.InsertChain(chain); err != nil {
 		panic(err)
 	}
+	pm, err := NewProtocolManager(gspec.Config, nil, mode, DefaultConfig.NetworkId, evmux, &testTxPool{added: newtx}, engine, blockchain, db, 1, nil, false)
+	if err != nil {
+		return nil, nil, err
+	}
+	pm.Start(1000)
+	return pm, db, nil
+}
 
-	pm, err := NewProtocolManager(gspec.Config, mode, DefaultConfig.NetworkId, evmux, &testTxPool{added: newtx}, engine, blockchain, db, false)
+// newTestProtocolManagerConsensus creates a new protocol manager for testing purposes,
+// that uses the specified consensus mechanism.
+func newTestProtocolManagerConsensus(consensusAlgo string, cliqueConfig *params.CliqueConfig, istanbulConfig *params.IstanbulConfig, raftMode bool) (*ProtocolManager, ethdb.Database, error) {
+
+	config := params.QuorumTestChainConfig
+	config.Clique = cliqueConfig
+	config.Istanbul = istanbulConfig
+
+	var (
+		blocks                  = 0
+		evmux                   = new(event.TypeMux)
+		engine consensus.Engine = ethash.NewFaker()
+		db                      = rawdb.NewMemoryDatabase()
+		gspec                   = &core.Genesis{
+			Config: params.TestChainConfig,
+			Alloc:  core.GenesisAlloc{testBank: {Balance: big.NewInt(1000000)}},
+		}
+		genesis       = gspec.MustCommit(db)
+		blockchain, _ = core.NewBlockChain(db, nil, gspec.Config, engine, vm.Config{}, nil)
+	)
+	chain, _ := core.GenerateChain(gspec.Config, genesis, ethash.NewFaker(), db, blocks, nil)
+	if _, err := blockchain.InsertChain(chain); err != nil {
+		panic(err)
+	}
+
+	switch consensusAlgo {
+	case "raft":
+		engine = ethash.NewFaker() //raft doesn't use engine, but just mirroring what runtime code does
+
+	case "istanbul":
+		var istanbul istanbul.Config
+		config.Istanbul.Epoch = istanbulConfig.Epoch
+		config.Istanbul.ProposerPolicy = istanbulConfig.ProposerPolicy
+
+		nodeKey, _ := crypto.GenerateKey()
+		engine = istanbulBackend.New(&istanbul, nodeKey, db)
+
+	case "clique":
+		engine = clique.New(config.Clique, db)
+
+	default:
+		engine = ethash.NewFaker()
+	}
+
+	pm, err := NewProtocolManager(config, nil, downloader.FullSync, DefaultConfig.NetworkId, evmux, &testTxPool{added: nil}, engine, blockchain, db, 1, nil, raftMode)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -78,7 +137,7 @@ func newTestProtocolManager(mode downloader.SyncMode, blocks int, generator func
 // with the given number of blocks already known, and potential notification
 // channels for different events. In case of an error, the constructor force-
 // fails the test.
-func newTestProtocolManagerMust(t *testing.T, mode downloader.SyncMode, blocks int, generator func(int, *core.BlockGen), newtx chan<- []*types.Transaction) (*ProtocolManager, *ethdb.MemDatabase) {
+func newTestProtocolManagerMust(t *testing.T, mode downloader.SyncMode, blocks int, generator func(int, *core.BlockGen), newtx chan<- []*types.Transaction) (*ProtocolManager, ethdb.Database) {
 	pm, db, err := newTestProtocolManager(mode, blocks, generator, newtx)
 	if err != nil {
 		t.Fatalf("Failed to create protocol manager: %v", err)
@@ -171,20 +230,35 @@ func newTestPeer(name string, version int, pm *ProtocolManager, shake bool) (*te
 			head    = pm.blockchain.CurrentHeader()
 			td      = pm.blockchain.GetTd(head.Hash(), head.Number.Uint64())
 		)
-		tp.handshake(nil, td, head.Hash(), genesis.Hash())
+		tp.handshake(nil, td, head.Hash(), genesis.Hash(), forkid.NewID(pm.blockchain), forkid.NewFilter(pm.blockchain))
 	}
 	return tp, errc
 }
 
 // handshake simulates a trivial handshake that expects the same state from the
 // remote side as we are simulating locally.
-func (p *testPeer) handshake(t *testing.T, td *big.Int, head common.Hash, genesis common.Hash) {
-	msg := &statusData{
-		ProtocolVersion: uint32(p.version),
-		NetworkId:       DefaultConfig.NetworkId,
-		TD:              td,
-		CurrentBlock:    head,
-		GenesisBlock:    genesis,
+func (p *testPeer) handshake(t *testing.T, td *big.Int, head common.Hash, genesis common.Hash, forkID forkid.ID, forkFilter forkid.Filter) {
+	var msg interface{}
+	switch {
+	case p.version == eth63:
+		msg = &statusData63{
+			ProtocolVersion: uint32(p.version),
+			NetworkId:       DefaultConfig.NetworkId,
+			TD:              td,
+			CurrentBlock:    head,
+			GenesisBlock:    genesis,
+		}
+	case p.version == eth64:
+		msg = &statusData{
+			ProtocolVersion: uint32(p.version),
+			NetworkID:       DefaultConfig.NetworkId,
+			TD:              td,
+			Head:            head,
+			Genesis:         genesis,
+			ForkID:          forkID,
+		}
+	default:
+		panic(fmt.Sprintf("unsupported eth protocol version: %d", p.version))
 	}
 	if err := p2p.ExpectMsg(p.app, StatusMsg, msg); err != nil {
 		t.Fatalf("status recv: %v", err)
